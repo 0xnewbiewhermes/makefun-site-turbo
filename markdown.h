@@ -259,117 +259,97 @@ static inline void sb_put_html_mode(SB *sb, const char *s, uint32_t len, int jso
     sb->len = (uint32_t)(d - sb->buf);
 }
 
-// Macro-specialized inline renderer (compile-time JSON_MODE = 1 or 0!) with register-cached write pointer `d` + speculative AVX2/SSE2 stores!
-#define DEFINE_MD_INLINE(FN_NAME, JSON_MODE) \
-static void FN_NAME(SB *out, const char *s, uint32_t len, MdLinkEnv *env) { \
-    sb_reserve(out, len + 128); \
-    char *d = out->buf + out->len; \
-    char *dend = out->buf + out->cap - 64; \
-    uint32_t i = 0; \
-    _Pragma("GCC diagnostic push") \
-    _Pragma("GCC diagnostic ignored \"-Wunused-label\"") \
-    /* Main SIMD speculative store + jump-to-first-special loop */ \
-    while (i + 32 <= len) { \
-        if (__builtin_expect(d > dend, 0)) { \
-            out->len = (uint32_t)(d - out->buf); \
-            sb_grow(out, (len - i) + 256); \
-            d = out->buf + out->len; \
-            dend = out->buf + out->cap - 64; \
-        } \
-        uint32_t mask; \
-        if (1) { \
-            /* Use AVX2 if available else two 16B SSE2 chunks */ \
-            goto simd_step; \
-        } \
-    simd_step:; \
-        goto after_simd; \
-    after_simd:; \
-        break; \
-    } \
-    _Pragma("GCC diagnostic pop") \
-    (void)d; (void)dend; (void)env; \
+// 9 inline-special bytes + < 0x20 flag table for dirty-tracking in json_mode!
+static const uint8_t MD_JSON_INLINE_SPECIAL[256] = {
+    1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1, 1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,
+    ['\\'] = 1, ['`'] = 1, ['*'] = 1, ['['] = 1,
+    ['&'] = 1,  ['<'] = 1, ['>'] = 1, ['"'] = 1, ['\''] = 1,
+};
+
+// Dirty-tracked fast span scanners for json_mode:
+// Track whether any byte in [from..j) needs inline/HTML/JSON processing.
+// When dirty == 0, caller copies s[from..j) with a single memcpy — ZERO recursion!
+static inline int32_t md_find_bt_dirty(const char *s, uint32_t len, uint32_t from, int *dirty) {
+    int d = 0;
+    for (uint32_t j = from; j < len; j++) {
+        uint8_t c = (uint8_t)s[j];
+        if (c == '`') { *dirty = d; return (int32_t)j; }
+        if (c < 0x20 || c == '&' || c == '<' || c == '>' || c == '"' || c == '\'' || c == '\\') d = 1;
+    }
+    *dirty = d;
+    return -1;
 }
-#undef DEFINE_MD_INLINE
 
-// Clean, zero-overhead compile-time specialized md_inline_json (JSON_MODE=1) and md_inline_raw (JSON_MODE=0)
-#ifdef __AVX2__
-#define MD_SIMD_STEP(JSON_MODE) do { \
-    const __m256i lo_lut = (JSON_MODE) \
-        ? _mm256_setr_epi8(0x18,0x10,0x11,0x10,0x10,0x10,0x11,0x11,0x10,0x10,0x11,0x14,0x16,0x10,0x12,0x10, \
-                           0x18,0x10,0x11,0x10,0x10,0x10,0x11,0x11,0x10,0x10,0x11,0x14,0x16,0x10,0x12,0x10) \
-        : _mm256_setr_epi8(0x08,0x00,0x01,0x00,0x00,0x00,0x01,0x01,0x00,0x00,0x01,0x04,0x06,0x00,0x02,0x00, \
-                           0x08,0x00,0x01,0x00,0x00,0x00,0x01,0x01,0x00,0x00,0x01,0x04,0x06,0x00,0x02,0x00); \
-    const __m256i hi_lut = (JSON_MODE) \
-        ? _mm256_setr_epi8(0x10,0x10,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, \
-                           0x10,0x10,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00) \
-        : _mm256_setr_epi8(0x00,0x00,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00, \
-                           0x00,0x00,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00); \
-    const __m256i v_0f = _mm256_set1_epi8(0x0f); \
-    const __m256i v_zero = _mm256_setzero_si256(); \
-    while (i + 32 <= len) { \
-        if (__builtin_expect(d > dend, 0)) { \
-            out->len = (uint32_t)(d - out->buf); \
-            sb_grow(out, (len - i) + 256); \
-            d = out->buf + out->len; \
-            dend = out->buf + out->cap - 64; \
-        } \
-        __m256i v = _mm256_loadu_si256((const __m256i *)(s + i)); \
-        _mm256_storeu_si256((__m256i *)d, v); \
-        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), v_0f); \
-        __m256i hit = _mm256_and_si256(_mm256_shuffle_epi8(lo_lut, v), _mm256_shuffle_epi8(hi_lut, hi)); \
-        uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, v_zero)); \
-        if (!mask) { d += 32; i += 32; continue; } \
-        uint32_t adv = (uint32_t)__builtin_ctz(mask); \
-        d += adv; i += adv; \
-        MD_HANDLE_SPECIAL(JSON_MODE); \
-    } \
-} while (0)
-#else
-#define MD_SIMD_STEP(JSON_MODE) do { \
-    const __m128i v_bs  = _mm_set1_epi8('\\'); \
-    const __m128i v_bt  = _mm_set1_epi8('`'); \
-    const __m128i v_st  = _mm_set1_epi8('*'); \
-    const __m128i v_lb  = _mm_set1_epi8('['); \
-    const __m128i v_amp = _mm_set1_epi8('&'); \
-    const __m128i v_lt  = _mm_set1_epi8('<'); \
-    const __m128i v_gt  = _mm_set1_epi8('>'); \
-    const __m128i v_dq  = _mm_set1_epi8('"'); \
-    const __m128i v_sq  = _mm_set1_epi8('\''); \
-    const __m128i v_80  = _mm_set1_epi8((char)0x80); \
-    const __m128i v_spu = _mm_set1_epi8((char)(0x20 ^ 0x80)); \
-    while (i + 16 <= len) { \
-        if (__builtin_expect(d > dend, 0)) { \
-            out->len = (uint32_t)(d - out->buf); \
-            sb_grow(out, (len - i) + 256); \
-            d = out->buf + out->len; \
-            dend = out->buf + out->cap - 64; \
-        } \
-        __m128i v = _mm_loadu_si128((const __m128i *)(s + i)); \
-        _mm_storeu_si128((__m128i *)d, v); \
-        __m128i m1 = _mm_or_si128(_mm_cmpeq_epi8(v, v_bs), _mm_cmpeq_epi8(v, v_bt)); \
-        __m128i m2 = _mm_or_si128(_mm_cmpeq_epi8(v, v_st), _mm_cmpeq_epi8(v, v_lb)); \
-        __m128i m3 = _mm_or_si128(_mm_cmpeq_epi8(v, v_amp), _mm_cmpeq_epi8(v, v_lt)); \
-        __m128i m4 = _mm_or_si128(_mm_cmpeq_epi8(v, v_gt), _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_sq))); \
-        __m128i m = _mm_or_si128(_mm_or_si128(m1, m2), _mm_or_si128(m3, m4)); \
-        if (JSON_MODE) m = _mm_or_si128(m, _mm_cmpgt_epi8(v_spu, _mm_xor_si128(v, v_80))); \
-        uint32_t mask = (uint32_t)_mm_movemask_epi8(m); \
-        if (!mask) { d += 16; i += 16; continue; } \
-        uint32_t adv = (uint32_t)__builtin_ctz(mask); \
-        d += adv; i += adv; \
-        MD_HANDLE_SPECIAL(JSON_MODE); \
-    } \
-} while (0)
-#endif
+static inline int32_t md_find_1star_dirty(const char *s, uint32_t len, uint32_t from, int *dirty) {
+    int d = 0;
+    for (uint32_t j = from; j < len; j++) {
+        uint8_t c = (uint8_t)s[j];
+        if (c == '*') {
+            if (j + 1 < len && s[j + 1] == '*') { d = 1; j++; continue; }
+            *dirty = d;
+            return (int32_t)j;
+        }
+        if (MD_JSON_INLINE_SPECIAL[c]) {
+            d = 1;
+            if (c == '\\' && j + 1 < len && MD_ESCAPABLE[(uint8_t)s[j + 1]]) j++;
+        }
+    }
+    *dirty = d;
+    return -1;
+}
 
-#define MD_HANDLE_SPECIAL(JSON_MODE) do { \
+static inline int32_t md_find_2star_dirty(const char *s, uint32_t len, uint32_t from, int *dirty) {
+    int d = 0;
+    for (uint32_t j = from; j + 1 < len; j++) {
+        uint8_t c = (uint8_t)s[j];
+        if (c == '*' && s[j + 1] == '*') { *dirty = d; return (int32_t)j; }
+        if (MD_JSON_INLINE_SPECIAL[c]) {
+            d = 1;
+            if (c == '\\' && j + 1 < len && MD_ESCAPABLE[(uint8_t)s[j + 1]]) j++;
+        }
+    }
+    *dirty = d;
+    return -1;
+}
+
+static inline int32_t md_find_rbracket_dirty(const char *s, uint32_t len, uint32_t from, int *dirty) {
+    int d = 0;
+    for (uint32_t j = from; j < len; j++) {
+        uint8_t c = (uint8_t)s[j];
+        if (c == ']') { *dirty = d; return (int32_t)j; }
+        if (MD_JSON_INLINE_SPECIAL[c]) {
+            d = 1;
+            if (c == '\\' && j + 1 < len && MD_ESCAPABLE[(uint8_t)s[j + 1]]) j++;
+        }
+    }
+    *dirty = d;
+    return -1;
+}
+
+// Fast inline copy of small clean span directly to register `d`
+static inline char *copy_small(char *d, const char *s, uint32_t n) {
+    if (n >= 16) {
+        xmemcpy(d, s, n);
+        return d + n;
+    }
+    if (n >= 8) { uint64_t t; __builtin_memcpy(&t, s, 8); __builtin_memcpy(d, &t, 8); s += 8; d += 8; n -= 8; }
+    if (n >= 4) { uint32_t t; __builtin_memcpy(&t, s, 4); __builtin_memcpy(d, &t, 4); s += 4; d += 4; n -= 4; }
+    while (n--) *d++ = *s++;
+    return d;
+}
+
+static void md_inline_json(SB *out, const char *s, uint32_t len, MdLinkEnv *env);
+
+// Handle one special byte at s[i] in json_mode with dirty-tracked zero-recursion fast paths!
+#define HANDLE_JSON_SPECIAL_AT_I() do { \
     uint8_t c = (uint8_t)s[i]; \
-    if (c == '\n' && (JSON_MODE)) { d[0] = '\\'; d[1] = 'n'; d += 2; i++; } \
+    if (c == '\n') { d[0] = '\\'; d[1] = 'n'; d += 2; i++; } \
     else if (c == '&') { __builtin_memcpy(d, "&amp;", 5); d += 5; i++; } \
     else if (c == '<') { __builtin_memcpy(d, "&lt;", 4); d += 4; i++; } \
     else if (c == '>') { __builtin_memcpy(d, "&gt;", 4); d += 4; i++; } \
     else if (c == '"') { __builtin_memcpy(d, "&quot;", 6); d += 6; i++; } \
     else if (c == '\'') { __builtin_memcpy(d, "&#39;", 5); d += 5; i++; } \
-    else if ((JSON_MODE) && c < 0x20) { \
+    else if (c < 0x20) { \
         if (c == '\t') { d[0]='\\'; d[1]='t'; d += 2; } \
         else if (c == '\r') { d[0]='\\'; d[1]='r'; d += 2; } \
         else if (c == '\b') { d[0]='\\'; d[1]='b'; d += 2; } \
@@ -378,87 +358,209 @@ static void FN_NAME(SB *out, const char *s, uint32_t len, MdLinkEnv *env) { \
         i++; \
     } else if (c == '*') { \
         if (i + 1 < len && s[i + 1] == '*') { \
-            int32_t j = md_find_unescaped_2star(s, len, i + 2); \
+            int dirty; \
+            int32_t j = md_find_2star_dirty(s, len, i + 2, &dirty); \
             if (j > (int32_t)(i + 2)) { \
-                __builtin_memcpy(d, "<strong>", 8); d += 8; \
-                out->len = (uint32_t)(d - out->buf); \
-                (JSON_MODE ? md_inline_json : md_inline_raw)(out, s + i + 2, (uint32_t)j - (i + 2), env); \
-                sb_reserve(out, 64); \
-                d = out->buf + out->len; dend = out->buf + out->cap - 64; \
-                __builtin_memcpy(d, "</strong>", 9); d += 9; \
+                uint32_t ilen = (uint32_t)j - (i + 2); \
+                if (__builtin_expect(!dirty && d + ilen + 24 <= dend + 64, 1)) { \
+                    __builtin_memcpy(d, "<strong>", 8); d += 8; \
+                    d = copy_small(d, s + i + 2, ilen); \
+                    __builtin_memcpy(d, "</strong>", 9); d += 9; \
+                } else { \
+                    __builtin_memcpy(d, "<strong>", 8); d += 8; \
+                    out->len = (uint32_t)(d - out->buf); \
+                    if (!dirty) sb_puts(out, s + i + 2, ilen); \
+                    else md_inline_json(out, s + i + 2, ilen, env); \
+                    sb_reserve(out, 64); \
+                    d = out->buf + out->len; dend = out->buf + out->cap - 64; \
+                    __builtin_memcpy(d, "</strong>", 9); d += 9; \
+                } \
                 i = (uint32_t)j + 2; \
             } else { d[0] = '*'; d[1] = '*'; d += 2; i += 2; } \
         } else { \
-            int32_t j = md_find_single_star(s, len, i + 1); \
+            int dirty; \
+            int32_t j = md_find_1star_dirty(s, len, i + 1, &dirty); \
             if (j > (int32_t)(i + 1)) { \
-                __builtin_memcpy(d, "<em>", 4); d += 4; \
-                out->len = (uint32_t)(d - out->buf); \
-                (JSON_MODE ? md_inline_json : md_inline_raw)(out, s + i + 1, (uint32_t)j - (i + 1), env); \
-                sb_reserve(out, 64); \
-                d = out->buf + out->len; dend = out->buf + out->cap - 64; \
-                __builtin_memcpy(d, "</em>", 5); d += 5; \
+                uint32_t ilen = (uint32_t)j - (i + 1); \
+                if (__builtin_expect(!dirty && d + ilen + 16 <= dend + 64, 1)) { \
+                    __builtin_memcpy(d, "<em>", 4); d += 4; \
+                    d = copy_small(d, s + i + 1, ilen); \
+                    __builtin_memcpy(d, "</em>", 5); d += 5; \
+                } else { \
+                    __builtin_memcpy(d, "<em>", 4); d += 4; \
+                    out->len = (uint32_t)(d - out->buf); \
+                    if (!dirty) sb_puts(out, s + i + 1, ilen); \
+                    else md_inline_json(out, s + i + 1, ilen, env); \
+                    sb_reserve(out, 64); \
+                    d = out->buf + out->len; dend = out->buf + out->cap - 64; \
+                    __builtin_memcpy(d, "</em>", 5); d += 5; \
+                } \
                 i = (uint32_t)j + 1; \
             } else { *d++ = '*'; i++; } \
         } \
     } else if (c == '[') { \
-        int32_t k = md_find_unescaped_char(s, len, i + 1, ']'); \
+        int dirty; \
+        int32_t k = md_find_rbracket_dirty(s, len, i + 1, &dirty); \
         int32_t m = (k != -1 && (uint32_t)k + 1 < len && s[k + 1] == '(') \
                     ? md_indexof(s, len, (uint32_t)k + 2, ')') : -1; \
         if (m != -1) { \
             Str target = str_make(s + k + 2, (uint32_t)m - ((uint32_t)k + 2)); \
             if (target.len > 0 && !has_js_ws(target)) { \
                 Str href = env->resolve(env, target); \
-                if (JSON_MODE) { __builtin_memcpy(d, "<a href=\\\"", 10); d += 10; } \
-                else { __builtin_memcpy(d, "<a href=\"", 9); d += 9; } \
+                __builtin_memcpy(d, "<a href=\\\"", 10); d += 10; \
                 out->len = (uint32_t)(d - out->buf); \
-                sb_put_html_mode(out, href.p, href.len, JSON_MODE); \
-                sb_reserve(out, 64); \
-                d = out->buf + out->len; \
-                if (JSON_MODE) { __builtin_memcpy(d, "\\\">", 3); d += 3; } \
-                else { d[0] = '"'; d[1] = '>'; d += 2; } \
-                out->len = (uint32_t)(d - out->buf); \
-                (JSON_MODE ? md_inline_json : md_inline_raw)(out, s + i + 1, (uint32_t)k - (i + 1), env); \
-                sb_reserve(out, 64); \
+                sb_put_html_mode(out, href.p, href.len, 1); \
+                uint32_t ilen = (uint32_t)k - (i + 1); \
+                sb_reserve(out, ilen + 80); \
                 d = out->buf + out->len; dend = out->buf + out->cap - 64; \
+                __builtin_memcpy(d, "\\\">", 3); d += 3; \
+                if (__builtin_expect(!dirty, 1)) { \
+                    d = copy_small(d, s + i + 1, ilen); \
+                } else { \
+                    out->len = (uint32_t)(d - out->buf); \
+                    md_inline_json(out, s + i + 1, ilen, env); \
+                    sb_reserve(out, 64); \
+                    d = out->buf + out->len; dend = out->buf + out->cap - 64; \
+                } \
                 __builtin_memcpy(d, "</a>", 4); d += 4; \
                 i = (uint32_t)m + 1; \
             } else { *d++ = '['; i++; } \
         } else { *d++ = '['; i++; } \
     } else if (c == '`') { \
-        int32_t j = md_indexof(s, len, i + 1, '`'); \
+        int dirty; \
+        int32_t j = md_find_bt_dirty(s, len, i + 1, &dirty); \
         if (j > (int32_t)(i + 1)) { \
-            __builtin_memcpy(d, "<code>", 6); d += 6; \
-            out->len = (uint32_t)(d - out->buf); \
-            sb_put_html_mode(out, s + i + 1, (uint32_t)j - (i + 1), JSON_MODE); \
-            sb_reserve(out, 64); \
-            d = out->buf + out->len; dend = out->buf + out->cap - 64; \
-            __builtin_memcpy(d, "</code>", 7); d += 7; \
+            uint32_t ilen = (uint32_t)j - (i + 1); \
+            if (__builtin_expect(!dirty && d + ilen + 20 <= dend + 64, 1)) { \
+                __builtin_memcpy(d, "<code>", 6); d += 6; \
+                d = copy_small(d, s + i + 1, ilen); \
+                __builtin_memcpy(d, "</code>", 7); d += 7; \
+            } else { \
+                __builtin_memcpy(d, "<code>", 6); d += 6; \
+                out->len = (uint32_t)(d - out->buf); \
+                if (!dirty) sb_puts(out, s + i + 1, ilen); \
+                else sb_put_html_mode(out, s + i + 1, ilen, 1); \
+                sb_reserve(out, 64); \
+                d = out->buf + out->len; dend = out->buf + out->cap - 64; \
+                __builtin_memcpy(d, "</code>", 7); d += 7; \
+            } \
             i = (uint32_t)j + 1; \
         } else { *d++ = '`'; i++; } \
-    } else { /* '\\' */ \
+    } else { \
         if (i + 1 < len && MD_ESCAPABLE[(uint8_t)s[i + 1]]) { \
             char n = s[i + 1]; \
             if (n == '>') { __builtin_memcpy(d, "&gt;", 4); d += 4; } \
-            else if (n == '\\' && (JSON_MODE)) { d[0] = '\\'; d[1] = '\\'; d += 2; } \
+            else if (n == '\\') { d[0] = '\\'; d[1] = '\\'; d += 2; } \
             else *d++ = n; \
             i += 2; \
         } else { \
-            if (JSON_MODE) { d[0] = '\\'; d[1] = '\\'; d += 2; } \
-            else *d++ = '\\'; \
+            d[0] = '\\'; d[1] = '\\'; d += 2; \
             i++; \
         } \
     } \
 } while (0)
 
-static void md_inline_json(SB *out, const char *s, uint32_t len, MdLinkEnv *env);
-static void md_inline_raw(SB *out, const char *s, uint32_t len, MdLinkEnv *env);
-
 static void md_inline_json(SB *out, const char *s, uint32_t len, MdLinkEnv *env) {
-    sb_reserve(out, len + 64);
+    sb_reserve(out, len + 128);
     char *d = out->buf + out->len;
     char *dend = out->buf + out->cap - 64;
     uint32_t i = 0;
-    MD_SIMD_STEP(1);
+#ifdef __AVX2__
+    const __m256i lo_lut = _mm256_setr_epi8(
+        0x18,0x10,0x11,0x10,0x10,0x10,0x11,0x11,0x10,0x10,0x11,0x14,0x16,0x10,0x12,0x10,
+        0x18,0x10,0x11,0x10,0x10,0x10,0x11,0x11,0x10,0x10,0x11,0x14,0x16,0x10,0x12,0x10);
+    const __m256i hi_lut = _mm256_setr_epi8(
+        0x10,0x10,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x10,0x10,0x01,0x02,0x00,0x04,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00);
+    const __m256i v_0f = _mm256_set1_epi8(0x0f);
+    const __m256i v_zero = _mm256_setzero_si256();
+    while (i + 32 <= len) {
+        if (__builtin_expect(d > dend, 0)) {
+            out->len = (uint32_t)(d - out->buf);
+            sb_grow(out, (len - i) + 256);
+            d = out->buf + out->len;
+            dend = out->buf + out->cap - 64;
+        }
+        __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
+        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), v_0f);
+        __m256i hit = _mm256_and_si256(_mm256_shuffle_epi8(lo_lut, v), _mm256_shuffle_epi8(hi_lut, hi));
+        uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, v_zero));
+        if (!mask) {
+            _mm256_storeu_si256((__m256i *)d, v);
+            d += 32; i += 32;
+            continue;
+        }
+        uint32_t cbase = i;
+        uint32_t cend = i + 32;
+        while (mask) {
+            uint32_t pos = cbase + (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1;
+            if (pos < i) continue;
+            if (__builtin_expect(d > dend, 0)) {
+                out->len = (uint32_t)(d - out->buf);
+                sb_grow(out, (len - i) + 256);
+                d = out->buf + out->len;
+                dend = out->buf + out->cap - 64;
+            }
+            if (pos > i) { d = copy_small(d, s + i, pos - i); i = pos; }
+            HANDLE_JSON_SPECIAL_AT_I();
+            if (i >= cend) goto next_avx_chunk;
+        }
+        if (i < cend) { d = copy_small(d, s + i, cend - i); i = cend; }
+    next_avx_chunk:;
+    }
+#else
+    const __m128i v_bs  = _mm_set1_epi8('\\');
+    const __m128i v_bt  = _mm_set1_epi8('`');
+    const __m128i v_st  = _mm_set1_epi8('*');
+    const __m128i v_lb  = _mm_set1_epi8('[');
+    const __m128i v_amp = _mm_set1_epi8('&');
+    const __m128i v_lt  = _mm_set1_epi8('<');
+    const __m128i v_gt  = _mm_set1_epi8('>');
+    const __m128i v_dq  = _mm_set1_epi8('"');
+    const __m128i v_sq  = _mm_set1_epi8('\'');
+    const __m128i v_80  = _mm_set1_epi8((char)0x80);
+    const __m128i v_spu = _mm_set1_epi8((char)(0x20 ^ 0x80));
+    while (i + 16 <= len) {
+        if (__builtin_expect(d > dend, 0)) {
+            out->len = (uint32_t)(d - out->buf);
+            sb_grow(out, (len - i) + 256);
+            d = out->buf + out->len;
+            dend = out->buf + out->cap - 64;
+        }
+        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+        __m128i m1 = _mm_or_si128(_mm_cmpeq_epi8(v, v_bs), _mm_cmpeq_epi8(v, v_bt));
+        __m128i m2 = _mm_or_si128(_mm_cmpeq_epi8(v, v_st), _mm_cmpeq_epi8(v, v_lb));
+        __m128i m3 = _mm_or_si128(_mm_cmpeq_epi8(v, v_amp), _mm_cmpeq_epi8(v, v_lt));
+        __m128i m4 = _mm_or_si128(_mm_cmpeq_epi8(v, v_gt), _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_sq)));
+        __m128i m = _mm_or_si128(_mm_or_si128(_mm_or_si128(m1, m2), _mm_or_si128(m3, m4)),
+                                 _mm_cmpgt_epi8(v_spu, _mm_xor_si128(v, v_80)));
+        uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
+        if (!mask) {
+            _mm_storeu_si128((__m128i *)d, v);
+            d += 16; i += 16;
+            continue;
+        }
+        uint32_t cbase = i;
+        uint32_t cend = i + 16;
+        while (mask) {
+            uint32_t pos = cbase + (uint32_t)__builtin_ctz(mask);
+            mask &= mask - 1;
+            if (pos < i) continue;
+            if (__builtin_expect(d > dend, 0)) {
+                out->len = (uint32_t)(d - out->buf);
+                sb_grow(out, (len - i) + 256);
+                d = out->buf + out->len;
+                dend = out->buf + out->cap - 64;
+            }
+            if (pos > i) { d = copy_small(d, s + i, pos - i); i = pos; }
+            HANDLE_JSON_SPECIAL_AT_I();
+            if (i >= cend) goto next_sse_chunk;
+        }
+        if (i < cend) { d = copy_small(d, s + i, cend - i); i = cend; }
+    next_sse_chunk:;
+    }
+#endif
     while (i < len) {
         if (__builtin_expect(d > dend, 0)) {
             out->len = (uint32_t)(d - out->buf);
@@ -467,42 +569,84 @@ static void md_inline_json(SB *out, const char *s, uint32_t len, MdLinkEnv *env)
             dend = out->buf + out->cap - 64;
         }
         uint8_t c = (uint8_t)s[i];
-        if (__builtin_expect(c >= 0x20 && !MD_INLINE_SPECIAL[c], 1)) {
+        if (__builtin_expect(!MD_JSON_INLINE_SPECIAL[c], 1)) {
             *d++ = (char)c;
             i++;
         } else {
-            MD_HANDLE_SPECIAL(1);
+            HANDLE_JSON_SPECIAL_AT_I();
         }
     }
     out->len = (uint32_t)(d - out->buf);
 }
 
+// Cold compact fallback for rare templates that use {{ page.content }} (HTML-escaped markdown)
+__attribute__((cold, noinline))
 static void md_inline_raw(SB *out, const char *s, uint32_t len, MdLinkEnv *env) {
-    sb_reserve(out, len + 64);
-    char *d = out->buf + out->len;
-    char *dend = out->buf + out->cap - 64;
     uint32_t i = 0;
-    MD_SIMD_STEP(0);
     while (i < len) {
-        if (__builtin_expect(d > dend, 0)) {
-            out->len = (uint32_t)(d - out->buf);
-            sb_grow(out, (len - i) + 128);
-            d = out->buf + out->len;
-            dend = out->buf + out->cap - 64;
-        }
         uint8_t c = (uint8_t)s[i];
-        if (__builtin_expect(!MD_INLINE_SPECIAL[c], 1)) {
-            *d++ = (char)c;
-            i++;
+        if (!MD_INLINE_SPECIAL[c]) { sb_putc(out, (char)c); i++; continue; }
+        if (c == '&') { sb_puts(out, "&amp;", 5); i++; }
+        else if (c == '<') { sb_puts(out, "&lt;", 4); i++; }
+        else if (c == '>') { sb_puts(out, "&gt;", 4); i++; }
+        else if (c == '"') { sb_puts(out, "&quot;", 6); i++; }
+        else if (c == '\'') { sb_puts(out, "&#39;", 5); i++; }
+        else if (c == '\\') {
+            if (i + 1 < len && MD_ESCAPABLE[(uint8_t)s[i + 1]]) {
+                if (s[i + 1] == '>') sb_puts(out, "&gt;", 4);
+                else sb_putc(out, s[i + 1]);
+                i += 2;
+            } else { sb_putc(out, '\\'); i++; }
+        } else if (c == '`') {
+            int32_t j = md_indexof(s, len, i + 1, '`');
+            if (j > (int32_t)(i + 1)) {
+                sb_puts(out, "<code>", 6);
+                sb_put_html_escaped(out, s + i + 1, (uint32_t)j - (i + 1));
+                sb_puts(out, "</code>", 7);
+                i = (uint32_t)j + 1;
+            } else { sb_putc(out, '`'); i++; }
+        } else if (c == '*') {
+            if (i + 1 < len && s[i + 1] == '*') {
+                int32_t j = md_find_unescaped_2star(s, len, i + 2);
+                if (j > (int32_t)(i + 2)) {
+                    sb_puts(out, "<strong>", 8);
+                    md_inline_raw(out, s + i + 2, (uint32_t)j - (i + 2), env);
+                    sb_puts(out, "</strong>", 9);
+                    i = (uint32_t)j + 2;
+                } else { sb_puts(out, "**", 2); i += 2; }
+            } else {
+                int32_t j = md_find_single_star(s, len, i + 1);
+                if (j > (int32_t)(i + 1)) {
+                    sb_puts(out, "<em>", 4);
+                    md_inline_raw(out, s + i + 1, (uint32_t)j - (i + 1), env);
+                    sb_puts(out, "</em>", 5);
+                    i = (uint32_t)j + 1;
+                } else { sb_putc(out, '*'); i++; }
+            }
         } else {
-            MD_HANDLE_SPECIAL(0);
+            int32_t k = md_find_unescaped_char(s, len, i + 1, ']');
+            int32_t m = (k != -1 && (uint32_t)k + 1 < len && s[k + 1] == '(')
+                        ? md_indexof(s, len, (uint32_t)k + 2, ')') : -1;
+            if (m != -1) {
+                Str target = str_make(s + k + 2, (uint32_t)m - ((uint32_t)k + 2));
+                if (target.len > 0 && !has_js_ws(target)) {
+                    Str href = env->resolve(env, target);
+                    sb_puts(out, "<a href=\"", 9);
+                    sb_put_html_escaped(out, href.p, href.len);
+                    sb_puts(out, "\">", 2);
+                    md_inline_raw(out, s + i + 1, (uint32_t)k - (i + 1), env);
+                    sb_puts(out, "</a>", 4);
+                    i = (uint32_t)m + 1;
+                    continue;
+                }
+            }
+            sb_putc(out, '['); i++;
         }
     }
-    out->len = (uint32_t)(d - out->buf);
 }
 
 static inline void md_inline_core(SB *out, const char *s, uint32_t len, MdLinkEnv *env, int json_mode) {
-    if (json_mode) md_inline_json(out, s, len, env);
+    if (__builtin_expect(json_mode, 1)) md_inline_json(out, s, len, env);
     else md_inline_raw(out, s, len, env);
 }
 

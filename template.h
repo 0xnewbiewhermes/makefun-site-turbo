@@ -713,12 +713,12 @@ static inline Val fast_eval(const RenderCtx *ctx, const Scope *sc, const TNode *
         case FOP_PAGE_OBJ: { Val r = val_undef(); r.kind = VAL_PAGE; r.ptr = ctx->page; return r; }
         case FOP_PAGE_TITLE: return val_str(ctx->page->title);
         case FOP_PAGE_URL: return val_str(ctx->page->url);
-        case FOP_PAGE_DATE: return val_str(ctx->page->date);
-        case FOP_PAGE_DATE_LONG: return val_str(ctx->page->date_long);
+        case FOP_PAGE_DATE: return val_str_md(ctx->page->date, 1);
+        case FOP_PAGE_DATE_LONG: return val_str_md(ctx->page->date_long, 1);
         case FOP_PAGE_SUMMARY: return val_str(ctx->page->summary);
         case FOP_PAGE_EXCERPT: return val_str_md(ctx->page->excerpt, ctx->md_is_json);
         case FOP_PAGE_READING_MIN: return val_int(ctx->page->reading_minutes);
-        case FOP_PAGE_SLUG: return val_str(ctx->page->slug);
+        case FOP_PAGE_SLUG: return val_str_md(ctx->page->slug, 1);
         case FOP_PAGE_CONTENT: return val_str_md(ctx->page->html, ctx->md_is_json);
         case FOP_PAGE_TAGS: { Val r = val_undef(); r.kind = VAL_ARR_TAG_REFS; r.ptr = ctx->page->tag_refs; r.arr_len = ctx->page->n_tag_refs; return r; }
         case FOP_PAGE_TOC: { Val r = val_undef(); r.kind = VAL_ARR_TOC; r.ptr = ctx->page->toc; r.arr_len = ctx->page->n_toc; return r; }
@@ -743,8 +743,8 @@ static inline Val fast_eval(const RenderCtx *ctx, const Scope *sc, const TNode *
         case FOP_TAG_POSTS: { Val r = val_undef(); r.kind = VAL_ARR_CARDS; r.ptr = ctx->tag->posts; r.arr_len = ctx->tag->n_posts; return r; }
         case FOP_LV_CARD_TITLE: return val_str(((const SourceObj *)cur->var_val.ptr)->title);
         case FOP_LV_CARD_URL: return val_str(((const SourceObj *)cur->var_val.ptr)->url);
-        case FOP_LV_CARD_DATE: return val_str(((const SourceObj *)cur->var_val.ptr)->date);
-        case FOP_LV_CARD_DATE_LONG: return val_str(((const SourceObj *)cur->var_val.ptr)->date_long);
+        case FOP_LV_CARD_DATE: return val_str_md(((const SourceObj *)cur->var_val.ptr)->date, 1);
+        case FOP_LV_CARD_DATE_LONG: return val_str_md(((const SourceObj *)cur->var_val.ptr)->date_long, 1);
         case FOP_LV_CARD_SUMMARY: return val_str(((const SourceObj *)cur->var_val.ptr)->summary);
         case FOP_LV_CARD_EXCERPT: return val_str_md(((const SourceObj *)cur->var_val.ptr)->excerpt, ctx->md_is_json);
         case FOP_LV_CARD_READING_MIN: return val_int(((const SourceObj *)cur->var_val.ptr)->reading_minutes);
@@ -753,11 +753,11 @@ static inline Val fast_eval(const RenderCtx *ctx, const Scope *sc, const TNode *
             Val r = val_undef(); r.kind = VAL_ARR_TAG_REFS; r.ptr = p->tag_refs; r.arr_len = p->n_tag_refs; return r;
         }
         case FOP_LV_TAG_NAME: return val_str(((const TagObj *)cur->var_val.ptr)->name);
-        case FOP_LV_TAG_SLUG: return val_str(((const TagObj *)cur->var_val.ptr)->slug);
+        case FOP_LV_TAG_SLUG: return val_str_md(((const TagObj *)cur->var_val.ptr)->slug, 1);
         case FOP_LV_TAG_URL: return val_str(((const TagObj *)cur->var_val.ptr)->url);
         case FOP_LV_TAG_COUNT: return val_int((int32_t)((const TagObj *)cur->var_val.ptr)->n_posts);
         case FOP_LV_TOC_LEVEL: return val_int(((const TocItem *)cur->var_val.ptr)->level);
-        case FOP_LV_TOC_ID: return val_str(((const TocItem *)cur->var_val.ptr)->id);
+        case FOP_LV_TOC_ID: return val_str_md(((const TocItem *)cur->var_val.ptr)->id, 1);
         case FOP_LV_TOC_HTML: return val_str_md(((const TocItem *)cur->var_val.ptr)->html, ctx->md_is_json);
         case FOP_LOOP_INDEX: return val_int(cur->loop_obj.index);
         case FOP_LOOP_FIRST: return val_bool(cur->loop_obj.first);

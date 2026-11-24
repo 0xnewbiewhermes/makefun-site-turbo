@@ -6,7 +6,7 @@
 
 #define STATIC_IN_CAP    (16u * 1024u * 1024u)
 #define STATIC_ARENA_CAP (48u * 1024u * 1024u)
-#define OUT_BUF_CAP      (256u * 1024u)
+#define OUT_BUF_CAP      (512u * 1024u)
 
 static char    g_in_buf[STATIC_IN_CAP + 64] __attribute__((aligned(64)));
 static uint8_t g_arena[STATIC_ARENA_CAP]    __attribute__((aligned(64)));

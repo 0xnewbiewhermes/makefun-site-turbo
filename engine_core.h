@@ -401,72 +401,70 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
         posts[k]->older = (k + 1 == n_posts) ? NULL : posts[k + 1];
     }
 
-    // 6. tags
+    // 6. tags (with raw tag-name -> tag_id cache so slugify_buf runs once per distinct tag spelling!)
     StrMap tag_by_slug; smap_init(&tag_by_slug, a, 128);
+    StrMap tag_by_raw; smap_init(&tag_by_raw, a, 128);
     uint32_t cap_tags = 64, n_tags = 0;
-    TagObj *tags = (TagObj *)arena_alloc(a, cap_tags * sizeof(TagObj));
-
-    // Store indices first during accumulation, then build final TagObj* pointers after sorting!
-    // Wait: TagObj moves when sorted or grown! So store TagObj* pointers via stable arena-allocated TagObj nodes OR store tag indices and remap after sorting!
-    // Storing stable arena-allocated TagObj* is cleaner AND zero remapping!
     TagObj **tag_ptrs = (TagObj **)arena_alloc(a, 64 * sizeof(TagObj *));
-    (void)tags;
     for (uint32_t k = 0; k < n_posts; k++) {
         SourceObj *p = posts[k];
         if (p->n_fm_tags == 0) continue;
         p->tag_refs = (TagObj **)arena_alloc(a, p->n_fm_tags * sizeof(TagObj *));
-        Str seen_slugs[64];
+        int32_t seen_ids[64];
         uint32_t n_seen = 0;
         StrMap seen_big; int use_big = (p->n_fm_tags > 64);
         if (use_big) smap_init(&seen_big, a, p->n_fm_tags * 2);
 
         for (uint32_t j = 0; j < p->n_fm_tags; j++) {
             Str tname = p->fm_tags[j];
-            char sbuf[65];
-            Str tslug = slugify_buf(tname, sbuf);
-            // Dedup within this post's own tags
+            int32_t tid = smap_get(&tag_by_raw, tname);
+            TagObj *tobj;
+            if (tid >= 0) {
+                tobj = tag_ptrs[tid];
+            } else {
+                char sbuf[65];
+                Str tslug = slugify_buf(tname, sbuf);
+                tid = smap_get(&tag_by_slug, tslug);
+                if (tid < 0) {
+                    Str dslug = arena_dup(a, tslug.p, tslug.len);
+                    tobj = (TagObj *)arena_alloc(a, sizeof(TagObj));
+                    xmemset(tobj, 0, sizeof(*tobj));
+                    tobj->name = tname;
+                    tobj->slug = dslug;
+                    uint32_t ul = base.len + 6 + dslug.len + 1;
+                    char *ub = arena_alloc_bytes(a, ul);
+                    xmemcpy(ub, base.p, base.len);
+                    xmemcpy(ub + base.len, "/tags/", 6);
+                    xmemcpy(ub + base.len + 6, dslug.p, dslug.len);
+                    ub[ul - 1] = '/';
+                    tobj->url = str_make(ub, ul);
+                    tobj->cap_posts = 16;
+                    tobj->posts = (SourceObj **)arena_alloc(a, 16 * sizeof(SourceObj *));
+                    if (n_tags >= cap_tags) {
+                        uint32_t ncap = cap_tags * 2;
+                        TagObj **np = (TagObj **)arena_alloc(a, ncap * sizeof(TagObj *));
+                        xmemcpy(np, tag_ptrs, n_tags * sizeof(TagObj *));
+                        tag_ptrs = np; cap_tags = ncap;
+                    }
+                    tid = (int32_t)n_tags;
+                    tag_ptrs[n_tags++] = tobj;
+                    smap_put(&tag_by_slug, dslug, tid);
+                } else {
+                    tobj = tag_ptrs[tid];
+                }
+                smap_put(&tag_by_raw, tname, tid);
+            }
+            // Dedup within this post's own tags (fast int32_t comparison!)
             int dup = 0;
             if (!use_big) {
                 for (uint32_t q = 0; q < n_seen; q++) {
-                    if (str_eq(seen_slugs[q], tslug)) { dup = 1; break; }
+                    if (seen_ids[q] == tid) { dup = 1; break; }
                 }
+                if (!dup) seen_ids[n_seen++] = tid;
             } else {
-                if (smap_has(&seen_big, tslug)) dup = 1;
+                if (!smap_put(&seen_big, tobj->slug, 1)) dup = 1;
             }
             if (dup) continue;
-
-            int32_t tid = smap_get(&tag_by_slug, tslug);
-            TagObj *tobj;
-            if (tid < 0) {
-                Str dslug = arena_dup(a, tslug.p, tslug.len);
-                tobj = (TagObj *)arena_alloc(a, sizeof(TagObj));
-                xmemset(tobj, 0, sizeof(*tobj));
-                tobj->name = tname;
-                tobj->slug = dslug;
-                uint32_t ul = base.len + 6 + dslug.len + 1;
-                char *ub = arena_alloc_bytes(a, ul);
-                xmemcpy(ub, base.p, base.len);
-                xmemcpy(ub + base.len, "/tags/", 6);
-                xmemcpy(ub + base.len + 6, dslug.p, dslug.len);
-                ub[ul - 1] = '/';
-                tobj->url = str_make(ub, ul);
-                tobj->cap_posts = 16;
-                tobj->posts = (SourceObj **)arena_alloc(a, 16 * sizeof(SourceObj *));
-                if (n_tags >= cap_tags) {
-                    uint32_t ncap = cap_tags * 2;
-                    TagObj **np = (TagObj **)arena_alloc(a, ncap * sizeof(TagObj *));
-                    xmemcpy(np, tag_ptrs, n_tags * sizeof(TagObj *));
-                    tag_ptrs = np; cap_tags = ncap;
-                }
-                tid = (int32_t)n_tags;
-                tag_ptrs[n_tags++] = tobj;
-                smap_put(&tag_by_slug, dslug, tid);
-            } else {
-                tobj = tag_ptrs[tid];
-            }
-
-            if (!use_big) seen_slugs[n_seen++] = tobj->slug;
-            else smap_put(&seen_big, tobj->slug, 1);
 
             if (tobj->n_posts >= tobj->cap_posts) {
                 uint32_t ncap = tobj->cap_posts * 2;
@@ -560,7 +558,13 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
     uint8_t *has_compiled_page = (uint8_t *)arena_alloc(a, n_valid_tpls + 1);
     xmemset(has_compiled_page, 0, n_valid_tpls + 1);
 
-    StrMap emitted_paths; smap_init(&emitted_paths, a, (n_sources + n_tags + 64) * 2);
+    // Only build emitted_paths hash map if any static file ends with "index.html" (else zero static files can be shadowed!)
+    int need_emitted_map = 0;
+    for (uint32_t i = 0; i < n_statics; i++) {
+        if (str_ends(statics[i].path, "index.html", 10)) { need_emitted_map = 1; break; }
+    }
+    StrMap emitted_paths;
+    if (need_emitted_map) smap_init(&emitted_paths, a, (n_sources + n_tags + 64) * 2);
 
     out_putc(o, '{');
     int first_kv = 1;
@@ -585,15 +589,21 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
             s->n_toc = md.n_toc;
             s->md_done = 1;
         }
-        // Output key: "<s.outDir>/index.html"
-        uint32_t klen = s->out_dir.len + 11;
-        char *kb = arena_alloc_bytes(a, klen);
-        xmemcpy(kb, s->out_dir.p, s->out_dir.len);
-        xmemcpy(kb + s->out_dir.len, "/index.html", 11);
-        Str out_key = str_make(kb, klen);
-        smap_put(&emitted_paths, out_key, 1);
-
-        emit_kv_prefix(o, &first_kv, out_key);
+        if (need_emitted_map) {
+            uint32_t klen = s->out_dir.len + 11;
+            char *kb = arena_alloc_bytes(a, klen);
+            xmemcpy(kb, s->out_dir.p, s->out_dir.len);
+            xmemcpy(kb + s->out_dir.len, "/index.html", 11);
+            Str out_key = str_make(kb, klen);
+            smap_put(&emitted_paths, out_key, 1);
+            emit_kv_prefix(o, &first_kv, out_key);
+        } else {
+            if (!first_kv) out_putc(o, ',');
+            first_kv = 0;
+            out_putc(o, '"');
+            out_json_body(o, s->out_dir.p, s->out_dir.len);
+            out_raw(o, "/index.html\":\"", 14);
+        }
         rctx.page = s;
         render_nodes_out(o, &compiled_page_tpls[tid], &root_sc, &rctx, 0);
         out_putc(o, '"');
@@ -643,17 +653,22 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
                 pg.older_url = sb_finish(&sb);
             }
 
-            Str out_key;
-            if (k == 1) {
-                out_key = str_lit("index.html");
+            if (need_emitted_map) {
+                Str out_key;
+                if (k == 1) out_key = str_lit("index.html");
+                else {
+                    SB sb; sb_init(&sb, a, 32);
+                    sb_puts(&sb, "page/", 5); sb_putu32(&sb, k); sb_puts(&sb, "/index.html", 11);
+                    out_key = sb_finish(&sb);
+                }
+                smap_put(&emitted_paths, out_key, 1);
+                emit_kv_prefix(o, &first_kv, out_key);
             } else {
-                SB sb; sb_init(&sb, a, 32);
-                sb_puts(&sb, "page/", 5); sb_putu32(&sb, k); sb_puts(&sb, "/index.html", 11);
-                out_key = sb_finish(&sb);
+                if (!first_kv) out_putc(o, ',');
+                first_kv = 0;
+                if (k == 1) out_raw(o, "\"index.html\":\"", 14);
+                else { out_raw(o, "\"page/", 6); out_putu32(o, k); out_raw(o, "/index.html\":\"", 14); }
             }
-            smap_put(&emitted_paths, out_key, 1);
-
-            emit_kv_prefix(o, &first_kv, out_key);
             rctx.posts = posts + start_i;
             rctx.n_posts = end_i - start_i;
             rctx.has_posts = 1;
@@ -670,15 +685,22 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
         TNodeList comp_tag = compile_template_for(a, &tpl_list[tag_tid], &rctx, ROOT_MASK_TAG);
         for (uint32_t i = 0; i < n_tags; i++) {
             TagObj *t = &sorted_tags[i];
-            uint32_t klen = 5 + t->slug.len + 11;
-            char *kb = arena_alloc_bytes(a, klen);
-            xmemcpy(kb, "tags/", 5);
-            xmemcpy(kb + 5, t->slug.p, t->slug.len);
-            xmemcpy(kb + 5 + t->slug.len, "/index.html", 11);
-            Str out_key = str_make(kb, klen);
-            smap_put(&emitted_paths, out_key, 1);
-
-            emit_kv_prefix(o, &first_kv, out_key);
+            if (need_emitted_map) {
+                uint32_t klen = 5 + t->slug.len + 11;
+                char *kb = arena_alloc_bytes(a, klen);
+                xmemcpy(kb, "tags/", 5);
+                xmemcpy(kb + 5, t->slug.p, t->slug.len);
+                xmemcpy(kb + 5 + t->slug.len, "/index.html", 11);
+                Str out_key = str_make(kb, klen);
+                smap_put(&emitted_paths, out_key, 1);
+                emit_kv_prefix(o, &first_kv, out_key);
+            } else {
+                if (!first_kv) out_putc(o, ',');
+                first_kv = 0;
+                out_raw(o, "\"tags/", 6);
+                out_raw(o, t->slug.p, t->slug.len);
+                out_raw(o, "/index.html\":\"", 14);
+            }
             rctx.tag = t;
             render_nodes_out(o, &comp_tag, &root_sc, &rctx, 0);
             out_putc(o, '"');
@@ -691,7 +713,7 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
     if (tags_tid >= 0) {
         TNodeList comp_tags = compile_template_for(a, &tpl_list[tags_tid], &rctx, 0);
         Str out_key = str_lit("tags/index.html");
-        smap_put(&emitted_paths, out_key, 1);
+        if (need_emitted_map) smap_put(&emitted_paths, out_key, 1);
         emit_kv_prefix(o, &first_kv, out_key);
         render_nodes_out(o, &comp_tags, &root_sc, &rctx, 0);
         out_putc(o, '"');
@@ -700,16 +722,14 @@ static void process_case(Arena *a, CaseInput *ci, OutBuf *o) {
     // 7e. Static files
     for (uint32_t i = 0; i < n_statics; i++) {
         RawFile f = statics[i];
-        if (smap_has(&emitted_paths, f.path)) {
+        if (need_emitted_map && smap_has(&emitted_paths, f.path)) {
             SB sb; sb_init(&sb, a, 48 + f.path.len);
             sb_puts(&sb, "shadowed ", 9);
             sb_puts(&sb, f.path.p, f.path.len);
             sb_puts(&sb, ": a built page has its path", 27);
             svec_push(&report, sb_finish(&sb));
         } else {
-            // Note: static file paths are unique in input.files? If duplicate in output, JSON last wins,
-            // makefun-site sets b.output[f.path] = f.content (checked against Object.hasOwn(b.output, f.path)!)
-            smap_put(&emitted_paths, f.path, 1);
+            if (need_emitted_map) smap_put(&emitted_paths, f.path, 1);
             emit_kv_prefix(o, &first_kv, f.path);
             out_json_body(o, f.content.p, f.content.len);
             out_putc(o, '"');

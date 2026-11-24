@@ -3,6 +3,10 @@ bench_cli.c
 test_fuzz.mjs
 build_and_test.sh
 build_node.sh
+bench_shm.sh
+bench_startup.sh
+verify_node_fuzz.sh
+test_compact.sh
 *.o
 *.gcda
 *.gcno

@@ -94,29 +94,29 @@ hit:
         return str_make(start, (uint32_t)(p - start));
     }
 
-    // Contains backslash escapes: unescape in-place from p onwards using speculative SIMD stores!
+    // Contains backslash escapes: unescape in-place with hoisted SIMD + safe speculative stores!
     char *dst = p;
+#ifdef __AVX2__
+    const __m256i v_dq = _mm256_set1_epi8('"');
+    const __m256i v_bs = _mm256_set1_epi8('\\');
+#else
+    const __m128i v_dq = _mm_set1_epi8('"');
+    const __m128i v_bs = _mm_set1_epi8('\\');
+#endif
     while (p < end) {
-        char c = *p;
-        if (c == '"') {
-            j->p = p + 1;
-            return str_make(start, (uint32_t)(dst - start));
-        }
-        if (c == '\\') {
-            p++;
-            if (p >= end) break;
-            char e = *p++;
-            if (e == 'n') *dst++ = '\n';
-            else if (e == '"') *dst++ = '"';
-            else if (e == '\\') *dst++ = '\\';
-            else if (e == 'r') *dst++ = '\r';
-            else if (e == 't') *dst++ = '\t';
-            else if (e == '/') *dst++ = '/';
-            else if (e == 'b') *dst++ = '\b';
-            else if (e == 'f') *dst++ = '\f';
-            else if (e == 'u' && p + 4 <= end) {
-                uint32_t cp = parse_u4(p);
-                p += 4;
+        if (__builtin_expect(*p == '\\', 1)) {
+            char e = p[1];
+            if (__builtin_expect(e == 'n', 1)) { *dst++ = '\n'; p += 2; }
+            else if (e == '"') { *dst++ = '"'; p += 2; }
+            else if (e == '\\') { *dst++ = '\\'; p += 2; }
+            else if (e == 'r') { *dst++ = '\r'; p += 2; }
+            else if (e == 't') { *dst++ = '\t'; p += 2; }
+            else if (e == '/') { *dst++ = '/'; p += 2; }
+            else if (e == 'b') { *dst++ = '\b'; p += 2; }
+            else if (e == 'f') { *dst++ = '\f'; p += 2; }
+            else if (e == 'u' && p + 6 <= end) {
+                uint32_t cp = parse_u4(p + 2);
+                p += 6;
                 if (cp >= 0xD800 && cp <= 0xDBFF && p + 6 <= end && p[0] == '\\' && p[1] == 'u') {
                     uint32_t lo = parse_u4(p + 2);
                     if (lo >= 0xDC00 && lo <= 0xDFFF) {
@@ -126,55 +126,60 @@ hit:
                 }
                 dst += utf8_encode(cp, dst);
             } else {
-                *dst++ = e;
+                p++;
+                if (p < end) *dst++ = *p++;
             }
-            continue;
+        } else if (*p == '"') {
+            j->p = p + 1;
+            return str_make(start, (uint32_t)(dst - start));
         }
-        // Safe SIMD copy (dst <= p always; never overwrite past p + adv!)
+
+        // Fast SIMD scan & copy until next '"' or '\\'
 #ifdef __AVX2__
-        {
-            const __m256i v_dq = _mm256_set1_epi8('"');
-            const __m256i v_bs = _mm256_set1_epi8('\\');
-            for (;;) {
-                __m256i v = _mm256_loadu_si256((const __m256i *)p);
-                __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(v, v_dq), _mm256_cmpeq_epi8(v, v_bs));
-                uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
-                if (!mask && p + 32 <= end) {
-                    _mm256_storeu_si256((__m256i *)dst, v);
-                    p += 32; dst += 32;
-                    continue;
-                }
-                uint32_t adv = mask ? (uint32_t)__builtin_ctz(mask) : 32u;
-                if (p + adv > end) adv = (uint32_t)(end - p);
+        for (;;) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)p);
+            __m256i m = _mm256_or_si256(_mm256_cmpeq_epi8(v, v_dq), _mm256_cmpeq_epi8(v, v_bs));
+            uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+            if (!mask && p + 32 <= end) {
+                _mm256_storeu_si256((__m256i *)dst, v);
+                p += 32; dst += 32;
+                continue;
+            }
+            uint32_t adv = mask ? (uint32_t)__builtin_ctz(mask) : 32u;
+            if (p + adv > end) adv = (uint32_t)(end - p);
+            if (__builtin_expect((size_t)(p - dst) >= 32u, 1)) {
+                // dst + 32 <= p: speculative store NEVER clobbers unread input!
+                _mm256_storeu_si256((__m256i *)dst, v);
+                p += adv; dst += adv;
+            } else {
                 if (adv >= 16) { __m128i t = _mm_loadu_si128((const __m128i *)p); _mm_storeu_si128((__m128i *)dst, t); p += 16; dst += 16; adv -= 16; }
                 if (adv >= 8)  { uint64_t t; __builtin_memcpy(&t, p, 8); __builtin_memcpy(dst, &t, 8); p += 8; dst += 8; adv -= 8; }
                 if (adv >= 4)  { uint32_t t; __builtin_memcpy(&t, p, 4); __builtin_memcpy(dst, &t, 4); p += 4; dst += 4; adv -= 4; }
                 while (adv--) *dst++ = *p++;
-                break;
             }
-            continue;
+            break;
         }
 #else
-        {
-            const __m128i v_dq = _mm_set1_epi8('"');
-            const __m128i v_bs = _mm_set1_epi8('\\');
-            for (;;) {
-                __m128i v = _mm_loadu_si128((const __m128i *)p);
-                __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_bs));
-                uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
-                if (!mask && p + 16 <= end) {
-                    _mm_storeu_si128((__m128i *)dst, v);
-                    p += 16; dst += 16;
-                    continue;
-                }
-                uint32_t adv = mask ? (uint32_t)__builtin_ctz(mask) : 16u;
-                if (p + adv > end) adv = (uint32_t)(end - p);
+        for (;;) {
+            __m128i v = _mm_loadu_si128((const __m128i *)p);
+            __m128i m = _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_bs));
+            uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
+            if (!mask && p + 16 <= end) {
+                _mm_storeu_si128((__m128i *)dst, v);
+                p += 16; dst += 16;
+                continue;
+            }
+            uint32_t adv = mask ? (uint32_t)__builtin_ctz(mask) : 16u;
+            if (p + adv > end) adv = (uint32_t)(end - p);
+            if (__builtin_expect((size_t)(p - dst) >= 16u, 1)) {
+                _mm_storeu_si128((__m128i *)dst, v);
+                p += adv; dst += adv;
+            } else {
                 if (adv >= 8)  { uint64_t t; __builtin_memcpy(&t, p, 8); __builtin_memcpy(dst, &t, 8); p += 8; dst += 8; adv -= 8; }
                 if (adv >= 4)  { uint32_t t; __builtin_memcpy(&t, p, 4); __builtin_memcpy(dst, &t, 4); p += 4; dst += 4; adv -= 4; }
                 while (adv--) *dst++ = *p++;
-                break;
             }
-            continue;
+            break;
         }
 #endif
     }

@@ -425,7 +425,7 @@ static inline void sb_put_html_escaped(SB *sb, const char *p, uint32_t len) {
 }
 
 // ---- Streaming L2-cache Output Buffer (direct JSON emitter!) ----
-#define OUT_BUF_CAP (256u * 1024u)
+#define OUT_BUF_CAP (512u * 1024u)
 
 typedef struct {
     uint8_t *buf;
@@ -481,223 +481,197 @@ static inline void out_putu32(OutBuf *o, uint32_t v) {
 
 static const char HEX_DIGITS[17] = "0123456789abcdef";
 
-// Emit JSON-escaped string body (without surrounding quotes) into OutBuf using speculative SIMD stores!
+// Emit JSON-escaped string body (without surrounding quotes) into OutBuf using register-cached write ptr + SIMD!
 static void out_json_body(OutBuf *o, const char *s, uint32_t len) {
     uint32_t i = 0;
+    if (__builtin_expect(o->pos + len + 64 > OUT_BUF_CAP, 0)) out_flush(o);
+    uint8_t *op = o->buf + o->pos;
+    uint8_t *oend = o->buf + OUT_BUF_CAP - 64;
 #ifdef __AVX2__
-    const __m256i v_dq   = _mm256_set1_epi8('"');
-    const __m256i v_bs   = _mm256_set1_epi8('\\');
-    const __m256i v_80   = _mm256_set1_epi8((char)0x80);
-    const __m256i v_sp_u = _mm256_set1_epi8((char)(0x20 ^ 0x80));
-    while (i + 32 <= len) {
-        if (__builtin_expect(o->pos + 64 > OUT_BUF_CAP, 0)) out_flush(o);
-        __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
-        __m256i vu = _mm256_xor_si256(v, v_80);
-        __m256i m = _mm256_or_si256(_mm256_cmpgt_epi8(v_sp_u, vu),
-                    _mm256_or_si256(_mm256_cmpeq_epi8(v, v_dq), _mm256_cmpeq_epi8(v, v_bs)));
-        uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
-        if (!mask) {
-            _mm256_storeu_si256((__m256i *)(o->buf + o->pos), v);
-            o->pos += 32;
-            i += 32;
-            continue;
-        }
-        uint32_t adv = (uint32_t)__builtin_ctz(mask);
-        _mm256_storeu_si256((__m256i *)(o->buf + o->pos), v);
-        o->pos += adv;
-        i += adv;
-        uint8_t c = (uint8_t)s[i++];
-        uint8_t *d = o->buf + o->pos;
-        if (c == '"') { d[0] = '\\'; d[1] = '"'; o->pos += 2; }
-        else if (c == '\\') { d[0] = '\\'; d[1] = '\\'; o->pos += 2; }
-        else if (c == '\n') { d[0] = '\\'; d[1] = 'n'; o->pos += 2; }
-        else if (c == '\r') { d[0] = '\\'; d[1] = 'r'; o->pos += 2; }
-        else if (c == '\t') { d[0] = '\\'; d[1] = 't'; o->pos += 2; }
-        else if (c == '\b') { d[0] = '\\'; d[1] = 'b'; o->pos += 2; }
-        else if (c == '\f') { d[0] = '\\'; d[1] = 'f'; o->pos += 2; }
-        else {
-            d[0] = '\\'; d[1] = 'u'; d[2] = '0'; d[3] = '0';
-            d[4] = (uint8_t)HEX_DIGITS[c >> 4];
-            d[5] = (uint8_t)HEX_DIGITS[c & 15];
-            o->pos += 6;
+    if (len >= 32) {
+        const __m256i v_dq   = _mm256_set1_epi8('"');
+        const __m256i v_bs   = _mm256_set1_epi8('\\');
+        const __m256i v_80   = _mm256_set1_epi8((char)0x80);
+        const __m256i v_sp_u = _mm256_set1_epi8((char)(0x20 ^ 0x80));
+        while (i + 32 <= len) {
+            if (__builtin_expect(op > oend, 0)) {
+                o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+            }
+            __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
+            __m256i vu = _mm256_xor_si256(v, v_80);
+            __m256i m = _mm256_or_si256(_mm256_cmpgt_epi8(v_sp_u, vu),
+                        _mm256_or_si256(_mm256_cmpeq_epi8(v, v_dq), _mm256_cmpeq_epi8(v, v_bs)));
+            uint32_t mask = (uint32_t)_mm256_movemask_epi8(m);
+            _mm256_storeu_si256((__m256i *)op, v);
+            if (!mask) { op += 32; i += 32; continue; }
+            uint32_t adv = (uint32_t)__builtin_ctz(mask);
+            op += adv; i += adv;
+            uint8_t c = (uint8_t)s[i++];
+            if (c == '"') { op[0] = '\\'; op[1] = '"'; op += 2; }
+            else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+            else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+            else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+            else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+            else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+            else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+            else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
         }
     }
 #else
-    const __m128i v_dq   = _mm_set1_epi8('"');
-    const __m128i v_bs   = _mm_set1_epi8('\\');
-    const __m128i v_80   = _mm_set1_epi8((char)0x80);
-    const __m128i v_sp_u = _mm_set1_epi8((char)(0x20 ^ 0x80));
-    while (i + 16 <= len) {
-        if (__builtin_expect(o->pos + 32 > OUT_BUF_CAP, 0)) out_flush(o);
-        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
-        __m128i vu = _mm_xor_si128(v, v_80);
-        __m128i m = _mm_or_si128(_mm_cmpgt_epi8(v_sp_u, vu),
-                    _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_bs)));
-        uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
-        if (!mask) {
-            _mm_storeu_si128((__m128i *)(o->buf + o->pos), v);
-            o->pos += 16;
-            i += 16;
-            continue;
-        }
-        uint32_t adv = (uint32_t)__builtin_ctz(mask);
-        _mm_storeu_si128((__m128i *)(o->buf + o->pos), v);
-        o->pos += adv;
-        i += adv;
-        uint8_t c = (uint8_t)s[i++];
-        uint8_t *d = o->buf + o->pos;
-        if (c == '"') { d[0] = '\\'; d[1] = '"'; o->pos += 2; }
-        else if (c == '\\') { d[0] = '\\'; d[1] = '\\'; o->pos += 2; }
-        else if (c == '\n') { d[0] = '\\'; d[1] = 'n'; o->pos += 2; }
-        else if (c == '\r') { d[0] = '\\'; d[1] = 'r'; o->pos += 2; }
-        else if (c == '\t') { d[0] = '\\'; d[1] = 't'; o->pos += 2; }
-        else if (c == '\b') { d[0] = '\\'; d[1] = 'b'; o->pos += 2; }
-        else if (c == '\f') { d[0] = '\\'; d[1] = 'f'; o->pos += 2; }
-        else {
-            d[0] = '\\'; d[1] = 'u'; d[2] = '0'; d[3] = '0';
-            d[4] = (uint8_t)HEX_DIGITS[c >> 4];
-            d[5] = (uint8_t)HEX_DIGITS[c & 15];
-            o->pos += 6;
+    if (len >= 16) {
+        const __m128i v_dq   = _mm_set1_epi8('"');
+        const __m128i v_bs   = _mm_set1_epi8('\\');
+        const __m128i v_80   = _mm_set1_epi8((char)0x80);
+        const __m128i v_sp_u = _mm_set1_epi8((char)(0x20 ^ 0x80));
+        while (i + 16 <= len) {
+            if (__builtin_expect(op > oend, 0)) {
+                o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+            }
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+            __m128i vu = _mm_xor_si128(v, v_80);
+            __m128i m = _mm_or_si128(_mm_cmpgt_epi8(v_sp_u, vu),
+                        _mm_or_si128(_mm_cmpeq_epi8(v, v_dq), _mm_cmpeq_epi8(v, v_bs)));
+            uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
+            _mm_storeu_si128((__m128i *)op, v);
+            if (!mask) { op += 16; i += 16; continue; }
+            uint32_t adv = (uint32_t)__builtin_ctz(mask);
+            op += adv; i += adv;
+            uint8_t c = (uint8_t)s[i++];
+            if (c == '"') { op[0] = '\\'; op[1] = '"'; op += 2; }
+            else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+            else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+            else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+            else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+            else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+            else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+            else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
         }
     }
 #endif
     while (i < len) {
-        if (__builtin_expect(o->pos + 8 > OUT_BUF_CAP, 0)) out_flush(o);
+        if (__builtin_expect(op > oend, 0)) {
+            o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+        }
         uint8_t c = (uint8_t)s[i++];
         if (__builtin_expect(c >= 0x20 && c != '"' && c != '\\', 1)) {
-            o->buf[o->pos++] = c;
-        } else {
-            uint8_t *d = o->buf + o->pos;
-            if (c == '"') { d[0] = '\\'; d[1] = '"'; o->pos += 2; }
-            else if (c == '\\') { d[0] = '\\'; d[1] = '\\'; o->pos += 2; }
-            else if (c == '\n') { d[0] = '\\'; d[1] = 'n'; o->pos += 2; }
-            else if (c == '\r') { d[0] = '\\'; d[1] = 'r'; o->pos += 2; }
-            else if (c == '\t') { d[0] = '\\'; d[1] = 't'; o->pos += 2; }
-            else if (c == '\b') { d[0] = '\\'; d[1] = 'b'; o->pos += 2; }
-            else if (c == '\f') { d[0] = '\\'; d[1] = 'f'; o->pos += 2; }
-            else {
-                d[0] = '\\'; d[1] = 'u'; d[2] = '0'; d[3] = '0';
-                d[4] = (uint8_t)HEX_DIGITS[c >> 4];
-                d[5] = (uint8_t)HEX_DIGITS[c & 15];
-                o->pos += 6;
-            }
-        }
+            *op++ = c;
+        } else if (c == '"') { op[0] = '\\'; op[1] = '"'; op += 2; }
+        else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+        else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+        else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+        else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+        else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+        else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+        else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
     }
+    o->pos = (uint32_t)(op - o->buf);
 }
 
-// Emit HTML-escaped AND JSON-escaped string body directly into OutBuf (for {{ var }}) using nibble-LUT SIMD!
-// Special bytes: < 0x20 (hi 0,1), '"' (22), '&' (26), '\'' (27), '<' (3C), '>' (3E), '\\' (5C)
+// Emit HTML-escaped AND JSON-escaped string body directly into OutBuf (for {{ var }}) using register-cached write ptr + nibble-LUT SIMD!
 static void out_json_html_body(OutBuf *o, const char *s, uint32_t len) {
     uint32_t i = 0;
+    if (__builtin_expect(o->pos + len + 64 > OUT_BUF_CAP, 0)) out_flush(o);
+    uint8_t *op = o->buf + o->pos;
+    uint8_t *oend = o->buf + OUT_BUF_CAP - 64;
 #ifdef __AVX2__
-    const __m256i lo_lut = _mm256_setr_epi8(
-        0x10, 0x10, 0x11, 0x10, 0x10, 0x10, 0x11, 0x11, 0x10, 0x10, 0x10, 0x10, 0x16, 0x10, 0x12, 0x10,
-        0x10, 0x10, 0x11, 0x10, 0x10, 0x10, 0x11, 0x11, 0x10, 0x10, 0x10, 0x10, 0x16, 0x10, 0x12, 0x10);
-    const __m256i hi_lut = _mm256_setr_epi8(
-        0x10, 0x10, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x10, 0x10, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
-    const __m256i v_0f   = _mm256_set1_epi8(0x0f);
-    const __m256i v_zero = _mm256_setzero_si256();
-    while (i + 32 <= len) {
-        if (__builtin_expect(o->pos + 64 > OUT_BUF_CAP, 0)) out_flush(o);
-        __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
-        __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), v_0f);
-        __m256i hit = _mm256_and_si256(_mm256_shuffle_epi8(lo_lut, v), _mm256_shuffle_epi8(hi_lut, hi));
-        uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, v_zero));
-        if (!mask) {
-            _mm256_storeu_si256((__m256i *)(o->buf + o->pos), v);
-            o->pos += 32;
-            i += 32;
-            continue;
-        }
-        uint32_t adv = (uint32_t)__builtin_ctz(mask);
-        _mm256_storeu_si256((__m256i *)(o->buf + o->pos), v);
-        o->pos += adv;
-        i += adv;
-        uint8_t c = (uint8_t)s[i++];
-        if (c == '&') out_raw(o, "&amp;", 5);
-        else if (c == '<') out_raw(o, "&lt;", 4);
-        else if (c == '>') out_raw(o, "&gt;", 4);
-        else if (c == '"') out_raw(o, "&quot;", 6);
-        else if (c == '\'') out_raw(o, "&#39;", 5);
-        else if (c == '\\') out_raw(o, "\\\\", 2);
-        else if (c == '\n') out_raw(o, "\\n", 2);
-        else if (c == '\r') out_raw(o, "\\r", 2);
-        else if (c == '\t') out_raw(o, "\\t", 2);
-        else if (c == '\b') out_raw(o, "\\b", 2);
-        else if (c == '\f') out_raw(o, "\\f", 2);
-        else {
-            char tmp[6] = {'\\','u','0','0', HEX_DIGITS[c >> 4], HEX_DIGITS[c & 15]};
-            out_raw(o, tmp, 6);
+    if (len >= 32) {
+        const __m256i lo_lut = _mm256_setr_epi8(
+            0x10, 0x10, 0x11, 0x10, 0x10, 0x10, 0x11, 0x11, 0x10, 0x10, 0x10, 0x10, 0x16, 0x10, 0x12, 0x10,
+            0x10, 0x10, 0x11, 0x10, 0x10, 0x10, 0x11, 0x11, 0x10, 0x10, 0x10, 0x10, 0x16, 0x10, 0x12, 0x10);
+        const __m256i hi_lut = _mm256_setr_epi8(
+            0x10, 0x10, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x10, 0x10, 0x01, 0x02, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00);
+        const __m256i v_0f   = _mm256_set1_epi8(0x0f);
+        const __m256i v_zero = _mm256_setzero_si256();
+        while (i + 32 <= len) {
+            if (__builtin_expect(op > oend, 0)) {
+                o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+            }
+            __m256i v = _mm256_loadu_si256((const __m256i *)(s + i));
+            __m256i hi = _mm256_and_si256(_mm256_srli_epi16(v, 4), v_0f);
+            __m256i hit = _mm256_and_si256(_mm256_shuffle_epi8(lo_lut, v), _mm256_shuffle_epi8(hi_lut, hi));
+            uint32_t mask = ~(uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(hit, v_zero));
+            _mm256_storeu_si256((__m256i *)op, v);
+            if (!mask) { op += 32; i += 32; continue; }
+            uint32_t adv = (uint32_t)__builtin_ctz(mask);
+            op += adv; i += adv;
+            uint8_t c = (uint8_t)s[i++];
+            if (c == '&') { __builtin_memcpy(op, "&amp;", 5); op += 5; }
+            else if (c == '<') { __builtin_memcpy(op, "&lt;", 4); op += 4; }
+            else if (c == '>') { __builtin_memcpy(op, "&gt;", 4); op += 4; }
+            else if (c == '"') { __builtin_memcpy(op, "&quot;", 6); op += 6; }
+            else if (c == '\'') { __builtin_memcpy(op, "&#39;", 5); op += 5; }
+            else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+            else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+            else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+            else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+            else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+            else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+            else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
         }
     }
 #else
-    const __m128i v_80   = _mm_set1_epi8((char)0x80);
-    const __m128i v_sp_u = _mm_set1_epi8((char)(0x20 ^ 0x80));
-    const __m128i v_dq   = _mm_set1_epi8('"');
-    const __m128i v_bs   = _mm_set1_epi8('\\');
-    const __m128i v_amp  = _mm_set1_epi8('&');
-    const __m128i v_lt   = _mm_set1_epi8('<');
-    const __m128i v_gt   = _mm_set1_epi8('>');
-    const __m128i v_sq   = _mm_set1_epi8('\'');
-    while (i + 16 <= len) {
-        if (__builtin_expect(o->pos + 32 > OUT_BUF_CAP, 0)) out_flush(o);
-        __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
-        __m128i vu = _mm_xor_si128(v, v_80);
-        __m128i m1 = _mm_or_si128(_mm_cmpgt_epi8(v_sp_u, vu), _mm_cmpeq_epi8(v, v_dq));
-        __m128i m2 = _mm_or_si128(_mm_cmpeq_epi8(v, v_bs), _mm_cmpeq_epi8(v, v_amp));
-        __m128i m3 = _mm_or_si128(_mm_cmpeq_epi8(v, v_lt), _mm_cmpeq_epi8(v, v_gt));
-        __m128i m  = _mm_or_si128(_mm_or_si128(m1, m2), _mm_or_si128(m3, _mm_cmpeq_epi8(v, v_sq)));
-        uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
-        if (!mask) {
-            _mm_storeu_si128((__m128i *)(o->buf + o->pos), v);
-            o->pos += 16;
-            i += 16;
-            continue;
-        }
-        uint32_t adv = (uint32_t)__builtin_ctz(mask);
-        _mm_storeu_si128((__m128i *)(o->buf + o->pos), v);
-        o->pos += adv;
-        i += adv;
-        uint8_t c = (uint8_t)s[i++];
-        if (c == '&') out_raw(o, "&amp;", 5);
-        else if (c == '<') out_raw(o, "&lt;", 4);
-        else if (c == '>') out_raw(o, "&gt;", 4);
-        else if (c == '"') out_raw(o, "&quot;", 6);
-        else if (c == '\'') out_raw(o, "&#39;", 5);
-        else if (c == '\\') out_raw(o, "\\\\", 2);
-        else if (c == '\n') out_raw(o, "\\n", 2);
-        else if (c == '\r') out_raw(o, "\\r", 2);
-        else if (c == '\t') out_raw(o, "\\t", 2);
-        else if (c == '\b') out_raw(o, "\\b", 2);
-        else if (c == '\f') out_raw(o, "\\f", 2);
-        else {
-            char tmp[6] = {'\\','u','0','0', HEX_DIGITS[c >> 4], HEX_DIGITS[c & 15]};
-            out_raw(o, tmp, 6);
+    if (len >= 16) {
+        const __m128i v_80   = _mm_set1_epi8((char)0x80);
+        const __m128i v_sp_u = _mm_set1_epi8((char)(0x20 ^ 0x80));
+        const __m128i v_dq   = _mm_set1_epi8('"');
+        const __m128i v_bs   = _mm_set1_epi8('\\');
+        const __m128i v_amp  = _mm_set1_epi8('&');
+        const __m128i v_lt   = _mm_set1_epi8('<');
+        const __m128i v_gt   = _mm_set1_epi8('>');
+        const __m128i v_sq   = _mm_set1_epi8('\'');
+        while (i + 16 <= len) {
+            if (__builtin_expect(op > oend, 0)) {
+                o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+            }
+            __m128i v = _mm_loadu_si128((const __m128i *)(s + i));
+            __m128i vu = _mm_xor_si128(v, v_80);
+            __m128i m1 = _mm_or_si128(_mm_cmpgt_epi8(v_sp_u, vu), _mm_cmpeq_epi8(v, v_dq));
+            __m128i m2 = _mm_or_si128(_mm_cmpeq_epi8(v, v_bs), _mm_cmpeq_epi8(v, v_amp));
+            __m128i m3 = _mm_or_si128(_mm_cmpeq_epi8(v, v_lt), _mm_cmpeq_epi8(v, v_gt));
+            __m128i m  = _mm_or_si128(_mm_or_si128(m1, m2), _mm_or_si128(m3, _mm_cmpeq_epi8(v, v_sq)));
+            uint32_t mask = (uint32_t)_mm_movemask_epi8(m);
+            _mm_storeu_si128((__m128i *)op, v);
+            if (!mask) { op += 16; i += 16; continue; }
+            uint32_t adv = (uint32_t)__builtin_ctz(mask);
+            op += adv; i += adv;
+            uint8_t c = (uint8_t)s[i++];
+            if (c == '&') { __builtin_memcpy(op, "&amp;", 5); op += 5; }
+            else if (c == '<') { __builtin_memcpy(op, "&lt;", 4); op += 4; }
+            else if (c == '>') { __builtin_memcpy(op, "&gt;", 4); op += 4; }
+            else if (c == '"') { __builtin_memcpy(op, "&quot;", 6); op += 6; }
+            else if (c == '\'') { __builtin_memcpy(op, "&#39;", 5); op += 5; }
+            else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+            else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+            else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+            else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+            else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+            else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+            else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
         }
     }
 #endif
     while (i < len) {
-        if (__builtin_expect(o->pos + 8 > OUT_BUF_CAP, 0)) out_flush(o);
+        if (__builtin_expect(op > oend, 0)) {
+            o->pos = (uint32_t)(op - o->buf); out_flush(o); op = o->buf;
+        }
         uint8_t c = (uint8_t)s[i++];
         if (__builtin_expect(c >= 0x20 && c != '"' && c != '\\' && c != '&' && c != '<' && c != '>' && c != '\'', 1)) {
-            o->buf[o->pos++] = c;
-        } else if (c == '&') out_raw(o, "&amp;", 5);
-        else if (c == '<') out_raw(o, "&lt;", 4);
-        else if (c == '>') out_raw(o, "&gt;", 4);
-        else if (c == '"') out_raw(o, "&quot;", 6);
-        else if (c == '\'') out_raw(o, "&#39;", 5);
-        else if (c == '\\') out_raw(o, "\\\\", 2);
-        else if (c == '\n') out_raw(o, "\\n", 2);
-        else if (c == '\r') out_raw(o, "\\r", 2);
-        else if (c == '\t') out_raw(o, "\\t", 2);
-        else if (c == '\b') out_raw(o, "\\b", 2);
-        else if (c == '\f') out_raw(o, "\\f", 2);
-        else {
-            char tmp[6] = {'\\','u','0','0', HEX_DIGITS[c >> 4], HEX_DIGITS[c & 15]};
-            out_raw(o, tmp, 6);
-        }
+            *op++ = c;
+        } else if (c == '&') { __builtin_memcpy(op, "&amp;", 5); op += 5; }
+        else if (c == '<') { __builtin_memcpy(op, "&lt;", 4); op += 4; }
+        else if (c == '>') { __builtin_memcpy(op, "&gt;", 4); op += 4; }
+        else if (c == '"') { __builtin_memcpy(op, "&quot;", 6); op += 6; }
+        else if (c == '\'') { __builtin_memcpy(op, "&#39;", 5); op += 5; }
+        else if (c == '\\') { op[0] = '\\'; op[1] = '\\'; op += 2; }
+        else if (c == '\n') { op[0] = '\\'; op[1] = 'n'; op += 2; }
+        else if (c == '\r') { op[0] = '\\'; op[1] = 'r'; op += 2; }
+        else if (c == '\t') { op[0] = '\\'; op[1] = 't'; op += 2; }
+        else if (c == '\b') { op[0] = '\\'; op[1] = 'b'; op += 2; }
+        else if (c == '\f') { op[0] = '\\'; op[1] = 'f'; op += 2; }
+        else { op[0]='\\'; op[1]='u'; op[2]='0'; op[3]='0'; op[4]=(uint8_t)HEX_DIGITS[c>>4]; op[5]=(uint8_t)HEX_DIGITS[c&15]; op += 6; }
     }
+    o->pos = (uint32_t)(op - o->buf);
 }
 
 // Also JSON-escape into an SB (for pre-escaping template literals & card cache!)
