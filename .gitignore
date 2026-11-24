@@ -1,0 +1,8 @@
+prof*.c
+bench_cli.c
+test_fuzz.mjs
+build_and_test.sh
+build_node.sh
+*.o
+*.gcda
+*.gcno
